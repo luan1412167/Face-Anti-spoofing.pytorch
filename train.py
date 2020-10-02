@@ -12,13 +12,25 @@ from torch import optim
 from torch import nn
 from torch.utils.data import DataLoader
 import dataset
+from prettytable import PrettyTable
+import glob
+import cv2
+import functional as F
+import math
+from utils import CropImage
+# train_live_rgb_dir   = './data/live_train_face_rgb'
+# train_live_depth_dir = './data/live_train_face_depth'
+# train_fake_rgb_dir   = './data/fake_train_face_rgb'
 
-train_live_rgb_dir   = './data/live_train_face_rgb'
-train_live_depth_dir = './data/live_train_face_depth'
-train_fake_rgb_dir   = './data/fake_train_face_rgb'
+# test_live_rgb_dir    = './data/live_test_face_rgb'
+# test_fake_rgb_dir    = './data/fake_test_face_rgb'
 
-test_live_rgb_dir    = './data/live_test_face_rgb'
-test_fake_rgb_dir    = './data/fake_test_face_rgb'
+train_live_rgb_dir   = '/home/dmp/PRNet-Depth-Generation/train/live'
+train_live_depth_dir = '/home/dmp/PRNet-Depth-Generation/train/live_depth'
+train_fake_rgb_dir   = '/home/dmp/PRNet-Depth-Generation/train/fake'
+
+test_live_rgb_dir    = '/home/dmp/PRNet-Depth-Generation/val/live'
+test_fake_rgb_dir    = '/home/dmp/PRNet-Depth-Generation/val/fake'
 
 parser = argparse.ArgumentParser(description='PyTorch Liveness Training')
 parser.add_argument('-s', '--scale', default=1.0, type=float,
@@ -29,7 +41,7 @@ parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=16, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -38,7 +50,7 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
 
 
 class Net(nn.Module):
-    def __init__(self, scale = 1.0,expand_ratio=1):
+    def __init__(self, scale = 1.0, expand_ratio=1):
         super(Net, self).__init__()
         def conv_bn(inp, oup, stride = 1):
             return nn.Sequential(
@@ -116,7 +128,7 @@ class FocalLoss(nn.Module):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.eps = eps
-        self.ce = nn.CrossEntropyLoss(reduction='none')
+        self.ce = nn.CrossEntropyLoss(reduction='mean')
 
     def forward(self, input, target):
         logp = self.ce(input, target)
@@ -125,23 +137,36 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 class DepthFocalLoss(nn.Module):
-    def __init__(self, gamma = 1, eps = 1e-7):
+    def __init__(self, gamma = 2, eps = 1e-7):
         super(DepthFocalLoss, self).__init__()
         self.gamma = gamma
         self.eps = eps
-        self.ce = nn.MSELoss(reduction='none')
+        self.ce = nn.MSELoss(reduction='mean')
 
     def forward(self, input, target):
         loss = self.ce(input, target)
         loss = (loss) ** self.gamma
         return loss.mean()
 
+def count_parameters(model):
+    table = PrettyTable(["Modules", "Parameters"])
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad: continue
+        param = parameter.numel()
+        table.add_row([name, param])
+        total_params+=param
+    print(table)
+    print(f"Total Trainable Params: {total_params}")
+    return total_params
+
 def main(args):
-    device = torch.device('cuda:5')
+    device = torch.device('cuda:0')
     net = Net(args.scale)
-    net = nn.DataParallel(net, device_ids = [5, 6, 7, 8])
+    # net = nn.DataParallel(net, device_ids = [5, 6, 7, 8])
     net = net.to(device)
-    print(net)
+    count_parameters(net)
+
     print("start load train data")
     normalize = standard_transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                               std=[0.229, 0.224, 0.225])
@@ -169,14 +194,19 @@ def main(args):
 
     criterion_class = FocalLoss()
     criterion_depth = DepthFocalLoss()
-    optimizer = torch.optim.Adam(net.parameters())
+    # optimizer = torch.optim.Adam(net.parameters())
+    optimizer = torch.optim.SGD(net.parameters(),
+                          lr=1e-2,
+                          weight_decay=5e-4,
+                          momentum=0.9)
+    schedule_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3, verbose=True)
 
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
-            g_err_rate = checkpoint['best_err_rate']
+            # g_err_rate = checkpoint['best_err_rate']
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -190,18 +220,18 @@ def main(args):
         return
 
     for epoch in range(args.start_epoch, args.epochs):
-
-        train(device, net, train_loader, criterion_depth, criterion_class, optimizer, epoch)
-        validate(device, net, val_loader)
+        print("lr: ", optimizer.param_groups[0]['lr'])
+        train(device, net, train_loader, criterion_depth, criterion_class, optimizer, schedule_lr, epoch)
+        validate(device, net, val_loader, schedule_lr)
        
         save_checkpoint({
             'epoch': epoch + 1,
             'state_dict': net.state_dict(),
             'optimizer' : optimizer.state_dict()
-        })
+        },  'checkpoint_{}.pth.tar'.format(epoch))
 
 
-def validate(device, net, val_loader, depth_dir = './depth_predict'):
+def validate(device, net, val_loader, schedule_lr, depth_dir = './depth_predict'):
     try:
         shutil.rmtree(depth_dir)
     except:
@@ -249,7 +279,7 @@ def validate(device, net, val_loader, depth_dir = './depth_predict'):
             live_error += 1
         else:
             break
-
+    schedule_lr.step((len(live_scores) - live_error) / len(live_scores))
     print('threshold 0.5: frp = ', fake_error / len(fake_scores),  '; tpr = ', (len(live_scores) - live_error) / len(live_scores))
 
 
@@ -286,7 +316,7 @@ def conv_loss(device, out_depth, label_depth, criterion_depth):
     return loss
 
 
-def train(device, net, train_loader, criterion_depth, criterion_class, optimizer, epoch):
+def train(device, net, train_loader, criterion_depth, criterion_class, optimizer, schedule_lr, epoch):
     losses_depth = AverageMeter()
     losses_class = AverageMeter()
     net.train()
@@ -308,10 +338,127 @@ def train(device, net, train_loader, criterion_depth, criterion_class, optimizer
         loss.backward()
         optimizer.step()
 
-        if i % 10 == 0:
+        if i % 100 == 0:
             print("epoch:{} batch:{} depth loss:{:f} depth avg loss:{:f} class loss:{:f} class avg loss:{:f}".format(
                 epoch, i, loss_depth.data.cpu().numpy(), losses_depth.avg.cpu().numpy(), loss_class.data.cpu().numpy(), losses_class.avg.cpu().numpy()))
 
+def predict(img , model_path):
+    normalize = standard_transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                              std=[0.229, 0.224, 0.225])
 
+    target_transform = standard_transforms.Compose([
+        standard_transforms.ToPILImage(),
+        standard_transforms.Resize((128, 128)),
+        standard_transforms.ToTensor(),
+        normalize
+    ])
+    # img = F.to_tensor(img)
+    # device = torch.device('cuda:0')
+    device = torch.device("cpu")
+    img = target_transform(img)
+    # img = img.unsqueeze(0).cuda(device)
+    img = img.unsqueeze(0)
+
+    net = Net()
+    checkpoint = torch.load(model_path, device)
+    net.load_state_dict(checkpoint['state_dict'])
+    # net = net.to(device)
+    net.eval()
+    with torch.no_grad():
+        output, class_ret = net(img)
+        class_ret = class_ret.detach().cpu()
+        class_output = nn.functional.softmax(class_ret, dim = 1)
+        print("class_output", class_output)
+        score = class_output[0][1]
+        return score
+
+class Detection:
+    def __init__(self):
+        caffemodel = "/home/dmp/Silent-Face-Anti-Spoofing/resources/detection_model/Widerface-RetinaFace.caffemodel"
+        deploy = "/home/dmp/Silent-Face-Anti-Spoofing/resources/detection_model/deploy.prototxt"
+        self.detector = cv2.dnn.readNetFromCaffe(deploy, caffemodel)
+        self.detector_confidence = 0.95
+
+    def get_bbox(self, img):
+        height, width = img.shape[0], img.shape[1]
+        aspect_ratio = width / height
+        if img.shape[1] * img.shape[0] >= 192 * 192:
+            img = cv2.resize(img,
+                             (int(192 * math.sqrt(aspect_ratio)),
+                              int(192 / math.sqrt(aspect_ratio))), interpolation=cv2.INTER_LINEAR)
+
+        blob = cv2.dnn.blobFromImage(img, 1, mean=(104, 117, 123))
+        self.detector.setInput(blob, 'data')
+        out = self.detector.forward('detection_out').squeeze()
+        max_conf_index = np.argmax(out[:, 2])
+        left, top, right, bottom = out[max_conf_index, 3]*width, out[max_conf_index, 4]*height, \
+                                   out[max_conf_index, 5]*width, out[max_conf_index, 6]*height
+        bbox = [int(left), int(top), int(right-left+1), int(bottom-top+1)]
+        return bbox
+
+def padding(image , bbox):
+    x1 = max(0, bbox[0]-32)
+    y1 = max(0, bbox[1]-32)
+    x2 = min(bbox[0] + bbox[2] +  32, image.shape[1])
+    y2 = min(bbox[1] + bbox[3] +  32, image.shape[0])
+    
+    img = image[y1: y2,
+                x1: x2]
+    return img
 if __name__ == '__main__':
-    main(parser.parse_args())
+    # main(parser.parse_args())
+    cap = cv2.VideoCapture("/home/dmp/Videos/sanity_data/real/2020-09-18-095512.webm")
+    # cap = cv2.VideoCapture(0)
+    
+    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cv2.namedWindow("image", cv2.WINDOW_NORMAL)
+    folder_path = "/home/dmp/Downloads/NUAA_photograph/Detectedface/ImposterFace/0004"
+    model_path = "/home/dmp/Face-Anti-spoofing.pytorch/checkpoint_23.pth.tar"
+    image_paths = glob.glob(folder_path + "/*")
+    detector = Detection()
+    # for image_path in image_paths:
+    #     image = cv2.imread(image_path)
+    #     if image is None:
+    #         continue
+    #     predict(img, model_path)
+    cropper = CropImage()
+
+
+    while cap.isOpened():
+        ret, image = cap.read()
+        if not ret:
+            continue
+        bbox = detector.get_bbox(image)
+        # img = image[bbox[1]: right_bottom_y+1,
+        #             left_top_x: right_bottom_x+1]
+        # img = padding(image, bbox)
+        param = {
+                "org_img": image,
+                "bbox": bbox,
+                "scale": 1.2,
+                "out_w": 112,
+                "out_h": 112,
+                "crop": True,
+            }
+        img = cropper.crop(**param)
+        
+        k = cv2.waitKey(1)
+        if k == ord("q"):
+            break
+        dst_img = cv2.resize(img, (128, 128), interpolation=cv2.INTER_AREA)
+        img = cv2.cvtColor(dst_img, cv2.COLOR_BGR2RGB)
+
+        score = predict(img, model_path)
+        print(score)
+        if score<0.5:
+            color = (255, 0, 0)
+        else:
+            color = (0, 0, 255)
+        cv2.rectangle(
+            image,
+            (bbox[0], bbox[1]),
+            (bbox[0] + bbox[2], bbox[1] + bbox[3]),
+            color, 2)
+        cv2.imshow("image", image)
+
+

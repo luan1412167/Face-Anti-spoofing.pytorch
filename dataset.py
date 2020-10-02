@@ -12,7 +12,9 @@ def make_dataset(rgb_dir, depth_dir=None):
     for file in os.listdir(rgb_dir):
         if file.endswith('.bmp') or file.endswith('.jpg') or file.endswith('.png'):
             if depth_dir is not None:
-                depth_file = file[:-4] + '_depth.jpg'
+                # depth_file = file[:-4] + '_depth.jpg'
+                depth_file = file[:-4] + '.jpg'
+
                 depth_file = os.path.join(depth_dir, depth_file)
                 if os.path.exists(depth_file):
                     items.append((os.path.join(rgb_dir, file), depth_file))
